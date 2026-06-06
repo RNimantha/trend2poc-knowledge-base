@@ -1,169 +1,187 @@
+import re
+import json
 import logging
-import time
-from typing import Any, Dict, List, Tuple
+from typing import Any, List, Tuple, Dict
 
-import faiss
-import numpy as np
 import openai
-from sentence_transformers import SentenceTransformer
+import faiss
+from tqdm import tqdm
 
 from app.config import settings
 
 
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 
-class HyPERetrieval:
-    """Class implementing HyPE-based retrieval."""
+class DocumentChunk:
+    def __init__(self, doc_id: int, chunk_id: int, text: str):
+        self.doc_id = doc_id
+        self.chunk_id = chunk_id
+        self.text = text
 
-    def __init__(
-        self,
-        model_name: str = "all-MiniLM-L6-v2",
-        openai_model: str = "gpt-3.5-turbo",
-        hypothetical_questions_per_chunk: int = 3,
-    ) -> None:
-        self.embedding_model = SentenceTransformer(model_name)
-        self.openai_model = openai_model
-        self.hypothetical_questions_per_chunk = hypothetical_questions_per_chunk
-        self.index = None  # FAISS index
-        self.chunk_id_to_text: Dict[int, str] = {}
-        self.hyp_qid_to_chunk_id: Dict[int, int] = {}
-        self.hyp_q_embeddings: np.ndarray | None = None
 
-        openai.api_key = settings.openai_api_key
+def chunk_document(text: str, max_chunk_size: int = 500, overlap: int = 50) -> List[str]:
+    """Split a document into overlapping chunks of max_chunk_size characters."""
+    chunks = []
+    start = 0
+    text_len = len(text)
+    while start < text_len:
+        end = min(start + max_chunk_size, text_len)
+        chunk = text[start:end]
+        chunks.append(chunk)
+        if end == text_len:
+            break
+        start = end - overlap  # overlap
+    return chunks
 
-    def chunk_documents(self, documents: List[str], chunk_size: int = 200) -> List[str]:
-        """Splits documents into chunks of approximately chunk_size tokens (approximate by words)."""
-        chunks = []
-        for doc in documents:
-            words = doc.split()
-            for i in range(0, len(words), chunk_size):
-                chunk = " ".join(words[i : i + chunk_size])
-                chunks.append(chunk)
-        logger.debug(f"Chunked documents into {len(chunks)} chunks.")
-        return chunks
 
-    def generate_hypothetical_questions(self, chunk: str) -> List[str]:
-        """Generate hypothetical questions for a given chunk using OpenAI chat completion."""
-        prompt = (
-            f"Given the following document chunk, generate {self.hypothetical_questions_per_chunk} "
-            "diverse, relevant, and insightful questions that someone might ask about this content. "
-            "Return the questions as a numbered list.\n\n" + chunk
-        )
-
+def embed_texts(texts: List[str]) -> List[List[float]]:
+    """Get embeddings for a list of texts using OpenAI."""
+    embeddings = []
+    batch_size = 16
+    for i in tqdm(range(0, len(texts), batch_size), desc="Embedding texts"):
+        batch = texts[i : i + batch_size]
         try:
-            response = openai.ChatCompletion.create(
-                model=self.openai_model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.7,
-                max_tokens=150,
-                n=1,
+            response = openai.embeddings.create(
+                model=settings.embedding_model_name,
+                input=batch
             )
-            text = response.choices[0].message.content.strip()
-            questions = self._parse_numbered_list(text)
-            if not questions:
-                logger.warning("No hypothetical questions generated; falling back to default question.")
-                questions = ["What is this chunk about?"]
-            return questions
+            batch_embeddings = [item["embedding"] for item in response["data"]]
+            embeddings.extend(batch_embeddings)
         except openai.error.OpenAIError as e:
-            logger.error(f"OpenAI API error during hypothetical question generation: {e}")
-            return ["What is this chunk about?"]
+            logging.error(f"OpenAI embedding API error: {e}")
+            raise
+    return embeddings
 
-    @staticmethod
-    def _parse_numbered_list(text: str) -> List[str]:
-        """Parse a numbered list from text into a list of strings."""
-        lines = text.splitlines()
-        questions = []
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            # Expect lines like '1. question'
-            if line[0].isdigit() and line[1:3] == ". ":
-                question = line[3:].strip()
-                questions.append(question)
-            else:
-                # fallback: if line does not start with number, just add it
-                questions.append(line)
-        return questions
 
-    def embed_texts(self, texts: List[str]) -> np.ndarray:
-        """Embed a list of texts using the sentence-transformers model."""
-        embeddings = self.embedding_model.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
-        return embeddings
+def build_faiss_index(embeddings: List[List[float]]) -> faiss.IndexFlatIP:
+    """Build a FAISS index for inner product similarity (cosine similarity with normalized vectors)."""
+    import numpy as np
 
-    def build_index(self, chunks: List[str]) -> None:
-        """Build FAISS index over hypothetical question embeddings linked to chunks."""
-        self.chunk_id_to_text = {i: chunk for i, chunk in enumerate(chunks)}
+    dim = len(embeddings[0])
+    index = faiss.IndexFlatIP(dim)
 
-        all_hyp_questions = []
-        hyp_qid_to_chunk_id = {}
+    # Normalize embeddings to unit length for cosine similarity
+    np_embeddings = np.array(embeddings, dtype="float32")
+    faiss.normalize_L2(np_embeddings)
 
-        for chunk_id, chunk_text in self.chunk_id_to_text.items():
-            hyp_questions = self.generate_hypothetical_questions(chunk_text)
-            # Limit to configured number
-            hyp_questions = hyp_questions[: self.hypothetical_questions_per_chunk]
-            for hyp_q in hyp_questions:
-                hyp_qid_to_chunk_id[len(all_hyp_questions)] = chunk_id
-                all_hyp_questions.append(hyp_q)
+    index.add(np_embeddings)
+    return index
 
-        if not all_hyp_questions:
-            raise RuntimeError("No hypothetical questions generated; cannot build index.")
 
-        self.hyp_q_embeddings = self.embed_texts(all_hyp_questions)
+def normalize_query_embedding(query_embedding: List[float]) -> List[float]:
+    import numpy as np
+    np_emb = np.array(query_embedding, dtype="float32")
+    faiss.normalize_L2(np_emb)
+    return np_emb
 
-        dim = self.hyp_q_embeddings.shape[1]
-        self.index = faiss.IndexFlatIP(dim)  # Cosine similarity with normalized embeddings
-        self.index.add(self.hyp_q_embeddings)
 
-        self.hyp_qid_to_chunk_id = hyp_qid_to_chunk_id
-        logger.info(f"Built FAISS index with {self.index.ntotal} hypothetical question embeddings.")
+def keyword_filter(chunks: List[DocumentChunk], query: str) -> List[int]:
+    """Return indices of chunks that contain at least one keyword from the query."""
+    query_keywords = set(re.findall(r"\w+", query.lower()))
+    matched_indices = []
+    for idx, chunk in enumerate(chunks):
+        chunk_words = set(re.findall(r"\w+", chunk.text.lower()))
+        if query_keywords.intersection(chunk_words):
+            matched_indices.append(idx)
+    return matched_indices
 
-    def retrieve(self, query: str, top_k: int = 5) -> List[Tuple[str, float]]:
-        """Retrieve top_k relevant chunks for the query using HyPE embeddings."""
-        if self.index is None or self.hyp_q_embeddings is None:
-            raise RuntimeError("Index not built. Call build_index() first.")
 
-        query_embedding = self.embed_texts([query])
+def hybrid_retrieve(
+    query: str,
+    chunks: List[DocumentChunk],
+    index: faiss.IndexFlatIP,
+    embeddings: List[List[float]],
+    top_k: int = 5
+) -> List[Tuple[DocumentChunk, float]]:
+    """Retrieve top_k chunks by hybrid semantic + keyword filtering.
 
-        distances, indices = self.index.search(query_embedding, top_k * 2)  # Search more to deduplicate
-
-        seen_chunks = set()
-        results: List[Tuple[str, float]] = []
-
-        for dist, idx in zip(distances[0], indices[0]):
-            if idx == -1:
-                continue
-            chunk_id = self.hyp_qid_to_chunk_id.get(idx)
-            if chunk_id is None or chunk_id in seen_chunks:
-                continue
-            seen_chunks.add(chunk_id)
-            chunk_text = self.chunk_id_to_text[chunk_id]
-            results.append((chunk_text, float(dist)))
-            if len(results) >= top_k:
-                break
-
-        return results
-
-    def generate_response(self, query: str, retrieved_chunks: List[str]) -> str:
-        """Generate a simple response grounded on retrieved chunks using OpenAI."""
-        context = "\n---\n".join(retrieved_chunks)
-        prompt = (
-            f"You are an assistant that answers questions based on the provided context. "
-            f"Use the context to answer the question as accurately as possible.\n\n"
-            f"Context:\n{context}\n\nQuestion: {query}\nAnswer:"
+    Returns list of (DocumentChunk, score) tuples.
+    """
+    # Embed query
+    try:
+        response = openai.embeddings.create(
+            model=settings.embedding_model_name,
+            input=[query]
         )
+        query_embedding = response["data"][0]["embedding"]
+    except openai.error.OpenAIError as e:
+        logging.error(f"OpenAI embedding API error: {e}")
+        raise
 
-        try:
-            response = openai.ChatCompletion.create(
-                model=self.openai_model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.5,
-                max_tokens=200,
-                n=1,
-            )
-            answer = response.choices[0].message.content.strip()
-            return answer
-        except openai.error.OpenAIError as e:
-            logger.error(f"OpenAI API error during generation: {e}")
-            return "Sorry, I could not generate a response at this time."
+    import numpy as np
+    query_emb_np = np.array(query_embedding, dtype="float32")
+    faiss.normalize_L2(query_emb_np)
+
+    # Search FAISS
+    D, I = index.search(np.expand_dims(query_emb_np, axis=0), top_k * 3)  # get more for filtering
+
+    # Keyword filter
+    keyword_matched_indices = set(keyword_filter(chunks, query))
+
+    # Combine semantic and keyword filtering
+    candidates = []
+    for score, idx in zip(D[0], I[0]):
+        if idx == -1:
+            continue
+        if idx in keyword_matched_indices:
+            candidates.append((chunks[idx], float(score)))
+
+    # If no candidates after filtering, fallback to top semantic
+    if not candidates:
+        candidates = [(chunks[idx], float(score)) for score, idx in zip(D[0], I[0]) if idx != -1][:top_k]
+
+    # Simple re-rank by keyword overlap count
+    query_keywords = set(re.findall(r"\w+", query.lower()))
+
+    def keyword_overlap_score(chunk: DocumentChunk) -> int:
+        chunk_words = set(re.findall(r"\w+", chunk.text.lower()))
+        return len(query_keywords.intersection(chunk_words))
+
+    candidates.sort(key=lambda x: (keyword_overlap_score(x[0]), x[1]), reverse=True)
+
+    return candidates[:top_k]
+
+
+def generate_answer(query: str, retrieved_chunks: List[DocumentChunk]) -> str:
+    """Generate an answer grounded in retrieved documents."""
+    context_text = "\n---\n".join(chunk.text for chunk in retrieved_chunks)
+
+    prompt = (
+        f"You are an AI assistant. Use the following context to answer the question."
+        f" If the answer is not contained within the context, say 'I don't know.'\n\n"
+        f"Context:\n{context_text}\n\nQuestion: {query}\nAnswer:"
+    )
+
+    try:
+        response = openai.chat.completions.create(
+            model=settings.model_name,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=300
+        )
+        answer = response.choices[0].message.content.strip()
+    except openai.error.OpenAIError as e:
+        logging.error(f"OpenAI generation API error: {e}")
+        raise
+
+    return answer
+
+
+def load_documents_from_json(path: str) -> List[Dict[str, Any]]:
+    """Load documents from a JSON file with format [{"id": int, "text": str}, ...]"""
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data
+
+
+def prepare_document_chunks(documents: List[Dict[str, Any]]) -> List[DocumentChunk]:
+    """Chunk all documents and return list of DocumentChunk."""
+    all_chunks = []
+    for doc in documents:
+        doc_id = doc.get("id")
+        text = doc.get("text", "")
+        chunks = chunk_document(text)
+        for i, chunk_text in enumerate(chunks):
+            all_chunks.append(DocumentChunk(doc_id=doc_id, chunk_id=i, text=chunk_text))
+    return all_chunks
