@@ -1,0 +1,6 @@
+[
+  "Hypothetical Prompt Embeddings (HyPE) is a technique that improves semantic retrieval by generating hypothetical questions for document chunks and embedding those questions to better align retrieval with user intent.",
+  "Retrieval-Augmented Generation (RAG) combines retrieval of relevant documents with generation from a language model to produce more accurate and context-aware responses.",
+  "The HyPE approach enhances RAG by using hypothetical questions to create richer embeddings that capture potential user queries, improving retrieval precision.",
+  "This POC demonstrates chunking documents, generating hypothetical questions using OpenAI's GPT, embedding those questions with sentence-transformers, indexing with FAISS, and retrieving relevant chunks for user queries."
+]
