@@ -1,66 +1,85 @@
+import sys
 import json
 import logging
-import sys
-from pathlib import Path
 from typing import List
 
-from app.config import settings
-from app.core import HyPERetrieval
+import openai
 
+from app.config import settings
+from app.core import (
+    load_documents_from_json,
+    prepare_document_chunks,
+    embed_texts,
+    build_faiss_index,
+    hybrid_retrieve,
+    generate_answer,
+    DocumentChunk
+)
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 
-def load_documents_from_json(path: Path) -> List[str]:
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, list):
-            logger.error("Input JSON must be a list of document strings.")
-            sys.exit(1)
-        return data
-    except Exception as e:
-        logger.error(f"Failed to load documents from {path}: {e}")
-        sys.exit(1)
+SAMPLE_INPUT_PATH = "examples/sample_input.json"
 
 
 def main() -> None:
-    print("Loading documents from examples/sample_input.json...")
-    documents = load_documents_from_json(Path(__file__).parent.parent / "examples" / "sample_input.json")
+    openai.api_key = settings.OPENAI_API_KEY
 
-    retriever = HyPERetrieval()
+    # Load sample documents
+    try:
+        documents = load_documents_from_json(SAMPLE_INPUT_PATH)
+    except Exception as e:
+        logging.error(f"Failed to load documents from {SAMPLE_INPUT_PATH}: {e}")
+        sys.exit(1)
 
-    print("Chunking documents and building HyPE index (this may take a moment)...")
-    chunks = retriever.chunk_documents(documents)
-    retriever.build_index(chunks)
+    # Prepare chunks
+    chunks: List[DocumentChunk] = prepare_document_chunks(documents)
+    if not chunks:
+        logging.error("No document chunks available.")
+        sys.exit(1)
 
-    print("HyPE index built. You can now enter queries.")
+    # Embed chunks
+    try:
+        chunk_texts = [chunk.text for chunk in chunks]
+        embeddings = embed_texts(chunk_texts)
+    except Exception as e:
+        logging.error(f"Embedding failed: {e}")
+        sys.exit(1)
 
-    while True:
-        query = input("Enter your query (or 'exit' to quit): ").strip()
-        if query.lower() in {"exit", "quit"}:
-            print("Exiting.")
-            break
-        if not query:
-            continue
+    # Build FAISS index
+    try:
+        index = build_faiss_index(embeddings)
+    except Exception as e:
+        logging.error(f"Failed to build FAISS index: {e}")
+        sys.exit(1)
 
-        retrieved = retriever.retrieve(query, top_k=3)
-        if not retrieved:
-            print("No relevant chunks found.")
-            continue
+    # Prompt user for query
+    print("Enter your query (or press Enter to use sample query):", end=" ")
+    user_query = input().strip()
 
-        print("\nRetrieved Chunks:")
-        for i, (chunk_text, score) in enumerate(retrieved, 1):
-            snippet = chunk_text[:200].replace('\n', ' ') + ("..." if len(chunk_text) > 200 else "")
-            print(f"- Chunk {i} (score: {score:.3f}): {snippet}")
+    if not user_query:
+        # Use sample query from sample input
+        sample_query = "What are the benefits of renewable energy?"
+        print(f"Using sample query: {sample_query}")
+        user_query = sample_query
 
-        retrieved_texts = [chunk for chunk, _ in retrieved]
-        response = retriever.generate_response(query, retrieved_texts)
+    # Retrieve relevant chunks
+    try:
+        retrieved = hybrid_retrieve(user_query, chunks, index, embeddings, top_k=5)
+    except Exception as e:
+        logging.error(f"Retrieval failed: {e}")
+        sys.exit(1)
 
-        print("\nGenerated Response:")
-        print(response)
-        print("\n" + "-" * 40 + "\n")
+    print(f"\nRetrieved {len(retrieved)} relevant document chunks.")
+
+    # Generate answer
+    try:
+        answer = generate_answer(user_query, [chunk for chunk, _ in retrieved])
+    except Exception as e:
+        logging.error(f"Generation failed: {e}")
+        sys.exit(1)
+
+    print(f"\nGenerated Answer:\n{answer}")
 
 
 if __name__ == "__main__":
