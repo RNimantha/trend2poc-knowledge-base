@@ -1,6 +1,22 @@
 [
-  "Hypothetical Prompt Embeddings (HyPE) is a technique that improves semantic retrieval by generating hypothetical questions for document chunks and embedding those questions to better align retrieval with user intent.",
-  "Retrieval-Augmented Generation (RAG) combines retrieval of relevant documents with generation from a language model to produce more accurate and context-aware responses.",
-  "The HyPE approach enhances RAG by using hypothetical questions to create richer embeddings that capture potential user queries, improving retrieval precision.",
-  "This POC demonstrates chunking documents, generating hypothetical questions using OpenAI's GPT, embedding those questions with sentence-transformers, indexing with FAISS, and retrieving relevant chunks for user queries."
+  {
+    "id": 1,
+    "text": "Renewable energy is energy from natural sources that are constantly replenished, such as sunlight, wind, rain, tides, waves, and geothermal heat. It is a sustainable alternative to fossil fuels and helps reduce greenhouse gas emissions."
+  },
+  {
+    "id": 2,
+    "text": "Solar power harnesses energy from the sun using photovoltaic cells or solar thermal collectors. It is one of the fastest-growing renewable energy technologies worldwide."
+  },
+  {
+    "id": 3,
+    "text": "Wind power uses wind turbines to convert kinetic energy from wind into electricity. It is widely used in many countries and can be deployed onshore or offshore."
+  },
+  {
+    "id": 4,
+    "text": "Hydropower generates electricity by using flowing water to spin turbines. It is one of the oldest and largest sources of renewable energy."
+  },
+  {
+    "id": 5,
+    "text": "The benefits of renewable energy include reducing air pollution, decreasing dependence on imported fuels, creating jobs, and mitigating climate change impacts."
+  }
 ]
